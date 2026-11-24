@@ -37,7 +37,7 @@ DEFAULTS = {
 }
 
 
-def load_calibration(path):
+def load_calibration(path, dispersion_floor):
     params = dict(DEFAULTS)
     if path and Path(path).exists():
         with open(path, encoding="utf-8") as f:
@@ -49,6 +49,18 @@ def load_calibration(path):
             params["nb_size_mom"] = md["nb_size_mom"]
         if "median_redeem_rate_merchant" in raw:
             params["median_redeem_rate_merchant"] = raw["median_redeem_rate_merchant"]
+
+    raw_r = params["nb_size_mom"]
+    if raw_r < dispersion_floor:
+        # 方法说明：真实数据里方差被极少数超大商户主导（矩估计对异常值非常敏感），
+        # 算出来的 size 参数(这里约0.012)会让 Gamma-Poisson 混合分布退化成
+        # "几乎全是0、偶尔出现超大值"，超过九成商户的基线交易量会趋近于0，
+        # 仿真出来的数据没法用来做实验。这里设一个下限，用更温和但依然长尾的
+        # 离散度参数替代，已知局限：这是为了教学/流程验证可用性做的折中，
+        # 不是对真实分布的精确还原；真实水平请参考 calibration_params.json 原始值。
+        print(f"[提示] 原始估计的离散度参数({raw_r:.4f})过于极端，会导致绝大多数商户"
+              f"基线趋近于0。已替换为下限值 {dispersion_floor}（仍保持长尾，但不至于退化）。")
+        params["nb_size_mom"] = dispersion_floor
     return params
 
 
@@ -69,10 +81,33 @@ def make_merchants(n, params, rng):
         "baseline_rate": rate_i,
         "redeem_prob": redeem_prob_i,
     })
-    # 用基线交易量分层（四分位），后面在层内做随机分流——这是"同质商家筛选+分层随机"
+    return merchants
+
+
+def add_strata(merchants):
+    """用基线交易量分层（四分位），后面在层内做随机分流——这是"分层随机"的关键一步。
+    放在"筛选同质商家"之后调用，这样四分位是在筛选后的同质商户池里重新划分的。
+    """
+    merchants = merchants.copy()
     merchants["stratum"] = pd.qcut(merchants["baseline_rate"], 4,
                                     labels=["Q1_低", "Q2", "Q3", "Q4_高"])
     return merchants
+
+
+def filter_homogeneous_merchants(merchants, min_quantile):
+    """"筛选同质商家"：剔除基线交易量过低的商户（接近"死店"，测不出效果）。
+
+    对应项目最初的设计：A/B 实验应该在"有一定基础经营活动"的同质商家里做，
+    而不是随便拉一批商家（含大量长期零交易的）就比较。min_quantile=0.25
+    表示剔除基线交易量处于后 25% 的商户。
+    """
+    if min_quantile <= 0:
+        return merchants
+    threshold = merchants["baseline_rate"].quantile(min_quantile)
+    kept = merchants[merchants["baseline_rate"] >= threshold].reset_index(drop=True)
+    print(f"[同质商家筛选] 剔除基线交易量低于第{min_quantile*100:.0f}分位({threshold:.3f})的商户："
+          f"{len(merchants)} -> {len(kept)}")
+    return kept
 
 
 def assign_groups(merchants, treat_ratio, adoption_rate, rng):
@@ -141,6 +176,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--calibration", default=None, help="calibrate_tianchi.py 输出的 json 路径（可选）")
     ap.add_argument("--n-merchants", type=int, default=1000)
+    ap.add_argument("--min-baseline-quantile", type=float, default=0.25,
+                    help="筛选同质商家：剔除基线交易量低于该分位数的商户，0表示不筛选")
     ap.add_argument("--treat-ratio", type=float, default=0.5, help="实验组占比")
     ap.add_argument("--adoption-rate", type=float, default=0.6, help="实验组里真正采纳方案的比例")
     ap.add_argument("--pre-months", type=int, default=3)
@@ -148,14 +185,18 @@ def main():
     ap.add_argument("--effect-size", type=float, default=0.15, help="采纳商家交易量相对提升幅度，0.15表示提升15%%")
     ap.add_argument("--coupon-effect", type=float, default=0.10, help="采纳商家核销率相对提升幅度")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--dispersion-floor", type=float, default=0.3,
+                    help="离散度参数下限，避免真实数据的极端长尾让仿真退化（默认0.3，见代码注释）")
     ap.add_argument("--out", default="data/simulated")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    params = load_calibration(args.calibration)
+    params = load_calibration(args.calibration, args.dispersion_floor)
     print("[使用的基线参数]", json.dumps(params, ensure_ascii=False, indent=2))
 
     merchants = make_merchants(args.n_merchants, params, rng)
+    merchants = filter_homogeneous_merchants(merchants, args.min_baseline_quantile)
+    merchants = add_strata(merchants)
     merchants = assign_groups(merchants, args.treat_ratio, args.adoption_rate, rng)
     check_balance(merchants)
 

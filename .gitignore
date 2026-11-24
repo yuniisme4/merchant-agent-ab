@@ -224,4 +224,6 @@ __marimo__/
 
 data/raw/
 .venv/
+data/simulated/
+data/calibration/
 
