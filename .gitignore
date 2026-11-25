@@ -226,4 +226,10 @@ data/raw/
 .venv/
 data/simulated/
 data/calibration/
+data/simulated_all/
+data/detect/
+data/simulated_funnel/
+data/diagnose/
+data/plans/
+
 
